@@ -24,7 +24,7 @@ class Policy(nn.Module):
         self.mu = nn.Sequential(nn.Linear(in_dim, 128), nn.ReLU(), 
                                 nn.Linear(128, 128), nn.ReLU(),
                                 nn.Linear(128, out_dim))
-        self.log_std = nn.Parameter(torch.zeros(out_dim) - 1.0)  # init std = exp(-1) ≈ 0.37
+        self.log_std = nn.Parameter(torch.zeros(out_dim))
     
     def __call__(self, x):
         mu = self.mu(x)
@@ -58,7 +58,7 @@ def rollout(env, pi):
     obs_scale = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)  # scale obs for nn
     
     while not done:
-        s_t = torch.FloatTensor(s * obs_scale)
+        s_t = torch.tensor(s * obs_scale, dtype=torch.float32)
         a, u, _, _ = pi(s_t)
         s, r, term, trunc, _ = env.step(a.numpy())
         trajectory.append((s_t, u, r))  # save state, action_sample, reward
@@ -76,7 +76,7 @@ def update(pi, opt, trajectories, gamma=0.99):
     
     states = torch.stack([x[0] for x in batch])
     us = torch.stack([x[1] for x in batch])
-    Gs = torch.FloatTensor([x[2] for x in batch])
+    Gs = torch.tensor([x[2] for x in batch], dtype=torch.float32)
     
     # recompute log probs with gradients (rollout was @no_grad)
     mus = pi.mu(states)
@@ -96,14 +96,15 @@ def update(pi, opt, trajectories, gamma=0.99):
 
 if __name__ == "__main__":
     env = gym.make("LunarLander-v3", continuous=True)
+    env_viz = gym.make("LunarLander-v3", continuous=True, render_mode="human")
     pi = Policy()
     opt = torch.optim.Adam(pi.parameters(), lr=3e-4)
     
     best_reward = -float('inf')
     reward_history = deque(maxlen=100)
-    all_rewards = []
     
     if PLOT:
+        all_rewards = []
         plt.ion()
         fig, ax = plt.subplots(figsize=(10, 4))
     
@@ -120,7 +121,8 @@ if __name__ == "__main__":
         reward_std = np.std(ep_rewards)
         reward_history.append(reward)
         smooth = np.mean(reward_history)
-        all_rewards.append(reward)
+        if PLOT:
+            all_rewards.append(reward)
         
         is_best = reward > best_reward
         if is_best:
@@ -146,14 +148,13 @@ if __name__ == "__main__":
             plt.pause(0.001)
         
         if i % 100 == 0:
-            env_vis = gym.make("LunarLander-v3", continuous=True, render_mode="human")
-            eval_reward = sum(x[2] for x in rollout(env_vis, pi))
-            env_vis.close()
+            eval_reward = sum(x[2] for x in rollout(env_viz, pi))
             tqdm.write(f"{'='*40}")
             tqdm.write(f"EVAL: {eval_reward:.1f} | batch: {reward:.1f}±{reward_std:.1f}")
             tqdm.write(f"{'='*40}")
     
     env.close()
+    env_viz.close()
     if PLOT:
         plt.ioff()
         plt.show()
