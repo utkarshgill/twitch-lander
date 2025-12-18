@@ -26,17 +26,19 @@ class Policy(nn.Module):
                                 nn.Linear(128, out_dim))
         self.log_std = nn.Parameter(torch.zeros(out_dim))
     
-    def __call__(self, x):
+    def __call__(self, x, deterministic=False):
         mu = self.mu(x)
         std = self.log_std.exp()
+        if deterministic:
+            a = torch.tanh(mu)  # no sampling, just use mean
+            return a, mu, mu, std
         u = Normal(mu, std).sample()
         a = torch.tanh(u)  # squash to [-1, 1]
         return a, u, mu, std
 
-def log_prob(u, mu, std):
+def log_prob(a, u, mu, std):
     # we sampled u from gaussian, but sent a=tanh(u) to env
     # change of variables: log P(a) = log P(u) - log|da/du| = log P(u) - log(1-a²)
-    a = torch.tanh(u)
     logp_u = Normal(mu, std).log_prob(u).sum(-1)
     logp_a = logp_u - torch.log(1 - a**2 + 1e-6).sum(-1)
     return logp_a
@@ -50,20 +52,20 @@ def returns(rewards, gamma=0.99):
         G.append(running)
     return G[::-1]
 
+# https://gymnasium.farama.org/environments/box2d/lunar_lander/#:~:text=For%20the%20default%20values%20of%20VIEWPORT_W%2C%20VIEWPORT_H%2C%20SCALE%2C%20and%20FPS%2C%20the%20scale%20factors%20equal%3A%20%E2%80%98x%E2%80%99%3A%2010%2C%20%E2%80%98y%E2%80%99%3A%206.666%2C%20%E2%80%98vx%E2%80%99%3A%205%2C%20%E2%80%98vy%E2%80%99%3A%207.5%2C%20%E2%80%98angle%E2%80%99%3A%201%2C%20%E2%80%98angular%20velocity%E2%80%99%3A%202.5
+OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
+
 @torch.no_grad()
-def rollout(env, pi):
+def rollout(env, pi, deterministic=False):
     s, _ = env.reset()
     trajectory = []
     done = False
     
-    # https://gymnasium.farama.org/environments/box2d/lunar_lander/#:~:text=For%20the%20default%20values%20of%20VIEWPORT_W%2C%20VIEWPORT_H%2C%20SCALE%2C%20and%20FPS%2C%20the%20scale%20factors%20equal%3A%20%E2%80%98x%E2%80%99%3A%2010%2C%20%E2%80%98y%E2%80%99%3A%206.666%2C%20%E2%80%98vx%E2%80%99%3A%205%2C%20%E2%80%98vy%E2%80%99%3A%207.5%2C%20%E2%80%98angle%E2%80%99%3A%201%2C%20%E2%80%98angular%20velocity%E2%80%99%3A%202.5
-    obs_scale = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
-    
     while not done:
-        s_t = torch.tensor(s * obs_scale, dtype=torch.float32)
-        a, u, _, _ = pi(s_t)
+        s_t = torch.tensor(s * OBS_SCALE, dtype=torch.float32)
+        a, u, _, _ = pi(s_t, deterministic=deterministic)
         s, r, term, trunc, _ = env.step(a.numpy())
-        trajectory.append((s_t, u, r))  # save state, action_sample, reward
+        trajectory.append((s_t, a, u, r))  # store state, action, sample, reward
         done = term or trunc
     
     return trajectory
@@ -72,18 +74,19 @@ def update(pi, opt, trajectories, gamma=0.99):
     # flatten all episodes into one batch
     batch = []
     for traj in trajectories:
-        G = returns([step[2] for step in traj], gamma)
-        for (s, u, r), g in zip(traj, G):
-            batch.append((s, u, g))
+        G = returns([step[3] for step in traj], gamma)
+        for (s, a, u, r), g in zip(traj, G):
+            batch.append((s, a, u, g))
     
     states = torch.stack([x[0] for x in batch])
-    us = torch.stack([x[1] for x in batch])
-    Gs = torch.tensor([x[2] for x in batch], dtype=torch.float32)
+    actions = torch.stack([x[1] for x in batch])
+    us = torch.stack([x[2] for x in batch])
+    Gs = torch.tensor([x[3] for x in batch], dtype=torch.float32)
     
-    # recompute log probs with gradients (rollout was @no_grad)
+    # recompute mu, std with gradients (rollout was @no_grad)
     mus = pi.mu(states)
     stds = pi.log_std.exp().expand_as(mus)
-    logps = log_prob(us, mus, stds)
+    logps = log_prob(actions, us, mus, stds)
     
     # REINFORCE: maximize E[log π * (G - baseline)]
     advantages = Gs - Gs.mean()  # baseline for variance reduction
@@ -93,8 +96,6 @@ def update(pi, opt, trajectories, gamma=0.99):
     loss.backward()
     torch.nn.utils.clip_grad_norm_(pi.parameters(), 0.5)
     opt.step()
-    
-    return loss.item(), Gs.mean().item()
 
 if __name__ == "__main__":
     env = gym.make("LunarLander-v3", continuous=True)
@@ -115,9 +116,9 @@ if __name__ == "__main__":
     
     for i in trange(1000, desc="training", ncols=80, leave=True):
         trajs = [rollout(env, pi) for _ in range(10)]
-        ep_rewards = [sum(step[2] for step in traj) for traj in trajs]
+        ep_rewards = [sum(step[3] for step in traj) for traj in trajs]
         
-        loss, _ = update(pi, opt, trajs)
+        update(pi, opt, trajs)
         
         reward = np.mean(ep_rewards)
         reward_std = np.std(ep_rewards)
@@ -150,9 +151,9 @@ if __name__ == "__main__":
             plt.pause(0.001)
         
         if i % 100 == 0:
-            eval_reward = sum(x[2] for x in rollout(env_viz, pi))
+            eval_reward = sum(x[3] for x in rollout(env_viz, pi, deterministic=True))
             tqdm.write(f"{'='*40}")
-            tqdm.write(f"EVAL: {eval_reward:.1f} | batch: {reward:.1f}±{reward_std:.1f}")
+            tqdm.write(f"EVAL: {eval_reward:.1f} (determ) | batch: {reward:.1f}±{reward_std:.1f}")
             tqdm.write(f"{'='*40}")
     
     env.close()
