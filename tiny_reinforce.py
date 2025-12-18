@@ -26,15 +26,12 @@ class Policy(nn.Module):
                                 nn.Linear(128, out_dim))
         self.log_std = nn.Parameter(torch.zeros(out_dim))
     
-    def __call__(self, x, deterministic=False):
+    def __call__(self, x):
         mu = self.mu(x)
         std = self.log_std.exp()
-        if deterministic:
-            a = torch.tanh(mu)  # no sampling, just use mean
-            return a, mu, mu, std
         u = Normal(mu, std).sample()
         a = torch.tanh(u)  # squash to [-1, 1]
-        return a, u, mu, std
+        return a, u
 
 def log_prob(a, u, mu, std):
     # we sampled u from gaussian, but sent a=tanh(u) to env
@@ -56,16 +53,16 @@ def returns(rewards, gamma=0.99):
 OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
 
 @torch.no_grad()
-def rollout(env, pi, deterministic=False):
+def rollout(env, pi):
     s, _ = env.reset()
     trajectory = []
     done = False
     
     while not done:
         s_t = torch.tensor(s * OBS_SCALE, dtype=torch.float32)
-        a, u, _, _ = pi(s_t, deterministic=deterministic)
+        a, u = pi(s_t)
         s, r, term, trunc, _ = env.step(a.numpy())
-        trajectory.append((s_t, a, u, r))  # store state, action, sample, reward
+        trajectory.append((s_t, a, u, r))
         done = term or trunc
     
     return trajectory
@@ -151,9 +148,9 @@ if __name__ == "__main__":
             plt.pause(0.001)
         
         if i % 100 == 0:
-            eval_reward = sum(x[3] for x in rollout(env_viz, pi, deterministic=True))
+            eval_reward = sum(x[3] for x in rollout(env_viz, pi))
             tqdm.write(f"{'='*40}")
-            tqdm.write(f"EVAL: {eval_reward:.1f} (determ) | batch: {reward:.1f}±{reward_std:.1f}")
+            tqdm.write(f"EVAL: {eval_reward:.1f} | batch: {reward:.1f}±{reward_std:.1f}")
             tqdm.write(f"{'='*40}")
     
     env.close()
