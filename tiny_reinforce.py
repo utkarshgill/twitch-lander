@@ -1,10 +1,10 @@
 """
-REINFORCE from scratch (~200 lines)
+1. run policy, collect episode
+2. compute returns G_t (discounted rewards)
+3. gradient ascent on E[log π(a|s) * G]
+4. repeat
 
-1. Collect experience by acting in environment until batch size reached
-2. Compute returns for each timestep
-3. Update policy: maximize E[log π(a|s) * (G - baseline)]
-4. Repeat
+High G → increase log π. Low G → decrease log π.
 """
 import gymnasium as gym
 import numpy as np
@@ -53,7 +53,6 @@ OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
 
 @torch.no_grad()
 def rollout(env, pi):
-    """Rollout a single episode, return trajectory data."""
     s, _ = env.reset()
     traj_states = []
     traj_actions = []
@@ -76,11 +75,7 @@ def rollout(env, pi):
     return traj_states, traj_actions, traj_raws, traj_rewards
 
 def train_one_epoch(env, pi, opt, batch_size=5000, gamma=0.99):
-    """
-    1. Collect experience by acting in environment until batch_size steps
-    2. Compute returns G_t for each timestep
-    3. Take a single policy gradient update step using advantages 
-    """
+
     # empty lists for logging
     batch_states = []
     batch_actions = []
@@ -143,6 +138,7 @@ if __name__ == "__main__":
     tqdm.write("-" * 45)
     
     for i in trange(1000, desc="training", ncols=80, leave=True):
+        
         # run one epoch: collect experience and update policy
         ep_rewards = train_one_epoch(env, pi, opt, batch_size=5000)
         
