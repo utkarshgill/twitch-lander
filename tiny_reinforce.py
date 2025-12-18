@@ -1,15 +1,6 @@
 """
-REINFORCE from scratch (~140 lines)
+REINFORCE from scratch (~200 lines)
 
-Policy gradient with returns and baseline:
-∇J(θ) = E_τ[Σ_t ∇log π_θ(a_t|s_t) * (G_t - b)]
-
-where:
-- π_θ(a|s) = tanh-squashed Gaussian policy
-- G_t = Σ_{t'=t}^T γ^(t'-t) * r_{t'} (return from timestep t)
-- b = mean baseline for variance reduction
-
-Algorithm (epoch structure):
 1. Collect experience by acting in environment until batch size reached
 2. Compute returns for each timestep
 3. Update policy: maximize E[log π(a|s) * (G - baseline)]
@@ -38,15 +29,14 @@ class Policy(nn.Module):
     def __call__(self, x):
         mu = self.mu(x)
         std = self.log_std.exp()
-        u = Normal(mu, std).sample()
-        a = torch.tanh(u)  # squash to [-1, 1]
-        return a, u
+        raw = Normal(mu, std).sample()  # sample from gaussian
+        a = torch.tanh(raw)  # squash to [-1, 1]
+        return a, raw
     
-    def log_prob(self, a, u, mu, std):
-        # we sampled u from gaussian, but sent a=tanh(u) to env
-        # change of variables: log P(a) = log P(u) - log|da/du| = log P(u) - log(1-a²)
-        logp_u = Normal(mu, std).log_prob(u).sum(-1)
-        logp_a = logp_u - torch.log(1 - a**2 + 1e-6).sum(-1)
+    def log_prob(self, a, raw, mu, std):
+        # change of variables: log P(a) = log P(raw) - log|da/draw|
+        logp_raw = Normal(mu, std).log_prob(raw).sum(-1)
+        logp_a = logp_raw - torch.log(1 - a**2 + 1e-6).sum(-1)
         return logp_a
 
 def returns(rewards, gamma=0.99):
@@ -62,78 +52,66 @@ def returns(rewards, gamma=0.99):
 OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
 
 @torch.no_grad()
-def rollout_episode(env, pi):
+def rollout(env, pi):
+    """Rollout a single episode, return trajectory data."""
     s, _ = env.reset()
-    ep_rews = []
+    traj_states = []
+    traj_actions = []
+    traj_raws = []
+    traj_rewards = []
     done = False
+    
     while not done:
         s_t = torch.tensor(s * OBS_SCALE, dtype=torch.float32)
-        a, u = pi(s_t)
+        a, raw = pi(s_t)
         s, r, term, trunc, _ = env.step(a.numpy())
-        ep_rews.append(r)
+        
+        traj_states.append(s_t)
+        traj_actions.append(a)
+        traj_raws.append(raw)
+        traj_rewards.append(r)
+        
         done = term or trunc
-    return sum(ep_rews)
+    
+    return traj_states, traj_actions, traj_raws, traj_rewards
 
 def train_one_epoch(env, pi, opt, batch_size=5000, gamma=0.99):
-
+    """
+    1. Collect experience by acting in environment until batch_size steps
+    2. Compute returns G_t for each timestep
+    3. Take a single policy gradient update step using advantages 
+    """
     # empty lists for logging
     batch_states = []
     batch_actions = []
-    batch_us = []
+    batch_raws = []
     batch_weights = []  # for return weights
     batch_rets = []     # for measuring episode returns
-    batch_lens = []     # for measuring episode lengths
-    
-    # reset episode-specific variables
-    s, _ = env.reset()
-    ep_rews = []
-    done = False
     
     # collect experience by acting in the environment with current policy
-    while True:
-        s_t = torch.tensor(s * OBS_SCALE, dtype=torch.float32)
+    while len(batch_states) < batch_size:
+        # rollout one episode
+        states, actions, raws, rewards = rollout(env, pi)
         
-        # act in environment (no grad during rollout)
-        with torch.no_grad():
-            a, u = pi(s_t)
+        # record episode info
+        batch_rets.append(sum(rewards))
         
-        s, r, term, trunc, _ = env.step(a.numpy())
-        
-        # save state, action, reward
-        batch_states.append(s_t)
-        batch_actions.append(a)
-        batch_us.append(u)
-        ep_rews.append(r)
-        
-        done = term or trunc
-        if done:
-            # if episode is over, record info about episode
-            ep_ret, ep_len = sum(ep_rews), len(ep_rews)
-            batch_rets.append(ep_ret)
-            batch_lens.append(ep_len)
-            
-            # the weight for each logprob(a_t|s_t) is return from t
-            batch_weights += returns(ep_rews, gamma)
-            
-            # reset episode-specific variables
-            s, _ = env.reset()
-            ep_rews = []
-            done = False
-            
-            # end experience loop if we have enough of it
-            if len(batch_states) > batch_size:
-                break
+        # add episode data to batch
+        batch_states.extend(states)
+        batch_actions.extend(actions)
+        batch_raws.extend(raws)
+        batch_weights += returns(rewards, gamma)
     
     # prepare batch tensors
     states = torch.stack(batch_states)
     actions = torch.stack(batch_actions)
-    us = torch.stack(batch_us)
+    raws = torch.stack(batch_raws)
     Gs = torch.tensor(batch_weights, dtype=torch.float32)
     
     # recompute mu, std with gradients (rollout was @no_grad)
     mus = pi.mu(states)
     stds = pi.log_std.exp().expand_as(mus)
-    logps = pi.log_prob(actions, us, mus, stds)
+    logps = pi.log_prob(actions, raws, mus, stds)
     
     # REINFORCE: maximize E[log π * (G - baseline)]
     advantages = Gs - Gs.mean()  # baseline for variance reduction
@@ -145,7 +123,7 @@ def train_one_epoch(env, pi, opt, batch_size=5000, gamma=0.99):
     torch.nn.utils.clip_grad_norm_(pi.parameters(), 0.5)
     opt.step()
     
-    return batch_rets, batch_lens
+    return batch_rets
 
 if __name__ == "__main__":
     env = gym.make("LunarLander-v3", continuous=True)
@@ -166,7 +144,7 @@ if __name__ == "__main__":
     
     for i in trange(1000, desc="training", ncols=80, leave=True):
         # run one epoch: collect experience and update policy
-        ep_rewards, ep_lens = train_one_epoch(env, pi, opt, batch_size=5000)
+        ep_rewards = train_one_epoch(env, pi, opt, batch_size=5000)
         
         reward = np.mean(ep_rewards)
         reward_std = np.std(ep_rewards)
@@ -200,7 +178,8 @@ if __name__ == "__main__":
             plt.pause(0.001)
         
         if i % 100 == 0:
-            eval_reward = rollout_episode(env_viz, pi)
+            _, _, _, eval_rewards = rollout(env_viz, pi)
+            eval_reward = sum(eval_rewards)
             tqdm.write(f"{'='*45}")
             tqdm.write(f"EVAL: {eval_reward:.1f} | epoch_mean: {reward:.1f}±{reward_std:.1f} ({n_episodes} eps)")
             tqdm.write(f"{'='*45}")
